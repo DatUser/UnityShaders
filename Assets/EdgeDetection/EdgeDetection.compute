@@ -1,0 +1,323 @@
+#pragma kernel EdgeDetectionDepth
+#pragma kernel EdgeDetectionColor
+#pragma kernel EdgeDetectionNormal
+#pragma kernel EdgeDetectionCustom
+#pragma kernel GaussianSmooth
+#pragma kernel IntensityGradient
+#pragma kernel NonMaxPass
+#pragma kernel Hysteresis
+#pragma kernel GaussianSoftSmooth
+#pragma kernel CustomColorRestore
+#pragma kernel Bloom
+#pragma kernel CelShading
+
+//Debug
+#pragma enable_d3d11_debug_symbols
+
+// Required for decompression
+#include "UnityCG.cginc"
+
+// Input buffers
+Texture2D<float4> _CameraColorBuffer;
+Texture2D<float4> _CameraDepthNormalsTexture;
+
+Texture2D<float4> _ColorEdgeBuffer;
+Texture2D<float4> _BlurredEdgeBuffer;
+
+//Dims
+int maxX;
+int maxY;
+
+//Threshold values
+float weakTh;
+float strongTh;
+
+//Used in blur
+float time;
+
+struct Functions
+{
+    float3 grayscale(float3 c)
+    {
+        float gray = c.x * 0.2127 + c.y * 0.7151  + c.z * 0.0722;
+        return float3(gray, gray, gray);
+    }
+
+    bool validCoords(int2 coords)
+    {
+        return coords.x >= 0 && coords.y >= 0 && coords.x < maxX && coords.y < maxY;
+    }
+};
+
+Functions f;
+
+//3x3 Gaussian kernel for soft blur to avoid pixelization of output img
+static float gaussianSoft[9] = { 1.0, 2.0, 1.0,
+                                    2.0, 4.0, 2.0,
+                                    1.0, 2.0, 1.0 };
+
+static float gaussianSoftVal = 16.0;
+
+//5x5 Gaussian kernel approximation with sigma=1.0
+static float gaussian[25] = { 2.0, 4.0, 5.0, 4.0, 2.0,
+						4.0, 9.0, 12.0, 9.0, 4.0,
+						5.0, 12.0, 15.0, 12.0, 5.0,
+						4.0, 9.0, 12.0, 9.0, 4.0,
+						2.0, 4.0, 5.0, 4.0, 2.0};
+
+static float gaussianVal = 159.0;
+
+//Sobel Filter 5x5 for gradient
+static float gradientX[25] = { 2.0, 1.0, 0.0, -1.0, -2.0,
+                                2.0, 1.0, 0.0, -1.0, -2.0,
+                                4.0, 2.0, 0.0, -2.0, -4.0,
+                                2.0, 1.0, 0.0, -1.0, -2.0,
+                                2.0, 1.0, 0.0, -1.0, -2.0};
+
+static float gradientY[25] = { 2.0, 2.0, 4.0, 2.0, 2.0,
+                                1.0, 1.0, 2.0, 1.0, 1.0,
+                                0.0, 0.0, 0.0, 0.0, 0.0,
+                                -1.0, -1.0, -2.0, -1.0, -1.0,
+                                -2.0, -2.0, -4.0, -2.0, -2.0};
+
+// Output buffer
+RWTexture2D<float4> _EdgesBufferRW;
+
+[numthreads(8, 8, 1)]
+void EdgeDetectionDepth(uint3 id : SV_DispatchThreadID)
+{
+	float4 depthNormal = _CameraDepthNormalsTexture.Load(int3(id.xy, 0));	
+	_EdgesBufferRW[id.xy] = float4(depthNormal.zw, 0.0, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+// Method used: Canny Edge Detector
+void EdgeDetectionColor(uint3 id : SV_DispatchThreadID)
+{	
+	float4 colorBuffer = _CameraColorBuffer.Load(int3(id.xy, 0));
+	_EdgesBufferRW[id.xy] = float4(colorBuffer.xyz * float3(1.0, 0.8, 0.5), 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void EdgeDetectionNormal(uint3 id : SV_DispatchThreadID)
+{
+	float4 depthNormal = _CameraDepthNormalsTexture.Load(int3(id.xy, 0));
+	_EdgesBufferRW[id.xy] = float4(depthNormal.xy, 0.0, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void EdgeDetectionCustom(uint3 id : SV_DispatchThreadID)
+{
+	float4 colorBuffer = _CameraColorBuffer.Load(int3(id.xy, 0));
+	float4 depthNormal = _CameraDepthNormalsTexture.Load(int3(id.xy, 0));
+	_EdgesBufferRW[id.xy] = float4(colorBuffer.xyz * 0.5 + depthNormal.xyy * 0.5f, 1.0);
+}
+
+//Image is turned gray during process
+[numthreads(8, 8, 1)]
+void GaussianSmooth(uint3 id : SV_DispatchThreadID)
+{
+    float colorSmooth = 0.0;
+    // double loop i: -2 -> 2 (j: -2 -> 2) 
+    [unroll(25)] for (int k = 0; k < 25; ++k)
+    {
+	    
+        int i = k / (int) 5 - 2;
+        int j = k % (int) 5 - 2;
+		
+        int2 texCoords = int2(id.x + i, id.y + j);
+        if (f.validCoords(texCoords))
+        {
+            float4 currColor4 = _ColorEdgeBuffer.Load(int3(texCoords, 0));
+
+            //computing gray
+            float currColor = f.grayscale(currColor4.xyz).x;
+            colorSmooth += gaussian[(i + 2) * 5 + (j + 2)] * currColor;
+        }
+    }
+
+    colorSmooth /= gaussianVal;
+
+    _EdgesBufferRW[id.xy] = float4(colorSmooth, colorSmooth, colorSmooth, 1.0);
+}
+
+//Computing intensity gradient using Sobel Method
+[numthreads(8, 8, 1)]
+void IntensityGradient(uint3 id : SV_DispatchThreadID)
+{    
+    float Lx = 0.0;
+    float Ly = 0.0;
+    
+    // double loop among px and neighbours (5x5 iterations)
+    // double loop i: -2 -> 2 (j: -2 -> 2)
+    [unroll(25)] for (int k = 0; k < 25; ++k)
+    {
+        int i = k / (int) 5 - 2;
+        int j = k % (int) 5 - 2;
+    	
+        int2 texCoords = int2(id.x + i, id.y + j);
+        if (f.validCoords(texCoords))
+        {
+            float currColor = _ColorEdgeBuffer.Load(int3(texCoords, 0)).x;
+
+            Lx += gradientX[(i + 2) * 5 + (j + 2)] * currColor;
+            Ly += gradientY[(i + 2) * 5 + (j + 2)] * currColor;
+        }
+    }
+
+    float L = sqrt(Lx * Lx + Ly * Ly);
+    //[0-PI]->[0-180]
+    float theta = 180.0 * atan2(Ly, Lx) / UNITY_PI;
+    if (theta < 0)
+        theta += 180.0;
+    
+    _EdgesBufferRW[id.xy] = float4(L, L, L, theta);
+}
+
+[numthreads(8, 8, 1)]
+void NonMaxPass(uint3 id : SV_DispatchThreadID)
+{
+    float2 currColor = _ColorEdgeBuffer.Load(int3(id.xy, 0)).xw;
+
+    float L = currColor.x;
+    float theta = currColor.y;
+
+    //Nearest to gradient direction coordinates
+    int2 texCoords1 = int2(-1, -1);
+    int2 texCoords2 = int2(-1, -1);
+
+    //East-West
+    if ((0.0 <= theta && theta < 22.5) || (157.5 <= theta && theta <= 180))
+    {
+        texCoords1 = int2(id.x, id.y + 1);
+        texCoords2 = int2(id.x, id.y - 1);
+    }
+    //NEast-SWest
+    else if (22.5 <= theta && theta < 67.5)
+    {
+        texCoords1 = int2(id.x - 1, id.y + 1);
+        texCoords2 = int2(id.x + 1, id.y - 1);
+    }
+    //North-South
+    else if (67.5 <= theta && theta < 112.5)
+    {
+        texCoords1 = int2(id.x + 1, id.y);
+        texCoords2 = int2(id.x - 1, id.y);
+    }
+    //NWest-SEast
+    else if (112.5 <= theta && theta < 157.5)
+    {
+        texCoords1 = int2(id.x - 1, id.y - 1);
+        texCoords2 = int2(id.x + 1, id.y + 1);
+    }
+    
+    float outColor = 0.0;
+    //Nearest neighbour
+    if (f.validCoords(texCoords1) && f.validCoords(texCoords2))
+    {
+        float Lneigh1 = _ColorEdgeBuffer.Load(int3(texCoords1, 0.0)).x;
+        float Lneigh2 = _ColorEdgeBuffer.Load(int3(texCoords2, 0.0)).x;
+        outColor = (L >= Lneigh1 && L >= Lneigh2) ? L : 0.0;
+    }
+    
+    _EdgesBufferRW[id.xy] = float4(outColor, outColor, outColor, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void Hysteresis(uint3 id : SV_DispatchThreadID)
+{
+    float currColor = _ColorEdgeBuffer.Load(int3(id.xy, 0)).x;
+    float outColor = 0.0;
+
+    if (currColor >= strongTh)
+    {
+        outColor = currColor;
+    }
+    else if (currColor >= weakTh)
+    {
+        [unroll(9)] for (int k = 0; k < 9; ++k)
+        {
+            int i = k / (int) 3 - 1;
+            int j = k % (int) 3 - 1;
+    	
+            int2 texCoords = int2(id.x + i, id.y + j);
+            if (f.validCoords(texCoords))
+            {
+                float neighColor = _ColorEdgeBuffer.Load(int3(texCoords, 0)).x;
+                if (neighColor >= strongTh)
+                {
+                    outColor = strongTh;
+                    break;
+                }
+            }
+        }
+        
+    }
+    
+    float3 outColor3 = float3(outColor, outColor, outColor);
+    _EdgesBufferRW[id.xy] = float4(outColor3, 1.0);    
+}
+
+//Soft blur, image has to be gray already
+[numthreads(8, 8, 1)]
+void GaussianSoftSmooth(uint3 id : SV_DispatchThreadID)
+{
+    float colorSmooth = 0.0;
+    // double loop i: -2 -> 2 (j: -2 -> 2) 
+    [unroll(9)] for (int k = 0; k < 9; ++k)
+    {
+	    
+        int i = k / (int) 3 - 1;
+        int j = k % (int) 3 - 1;
+		
+        int2 texCoords = int2(id.x + i, id.y + j);
+        if (f.validCoords(texCoords))
+        {
+            float4 currColor = _ColorEdgeBuffer.Load(int3(texCoords, 0));
+
+            //computing gray
+            colorSmooth += gaussianSoft[(i + 1) * 3 + (j + 1)] * currColor.x;
+        }
+    }
+
+    colorSmooth /= gaussianSoftVal;
+
+    _EdgesBufferRW[id.xy] = float4(colorSmooth, colorSmooth, colorSmooth, 1.0);
+}
+
+//---------Custom part---------//
+[numthreads(8, 8, 1)]
+void CustomColorRestore(uint3 id : SV_DispatchThreadID)
+{
+    float4 currColor = _ColorEdgeBuffer.Load(int3(id.xy, 0));
+    float4 depthNormal = _CameraDepthNormalsTexture.Load(int3(id.xy, 0));
+    
+    float3 outColor = (currColor.x == 0.0) ? float3(0.0, 0.0, 0.0) :
+        currColor.xyz * 0.0 + depthNormal.xyy * 1.0f;
+    
+    _EdgesBufferRW[id.xy] = float4(outColor, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void Bloom(uint3 id : SV_DispatchThreadID)
+{
+    float3 currColor = _ColorEdgeBuffer.Load(int3(id.xy, 0)).xyz;
+    float3 blurredColor = _BlurredEdgeBuffer.Load(int3(id.xy, 0)).xyz;
+
+    currColor += blurredColor;
+    //tone mapping
+    float3 outColor = float3(1.0, 1.0, 1.0) - exp(-currColor * (0.9 * sin(time * 2.0) / 2.0 + 0.6));
+
+    _EdgesBufferRW[id.xy] = float4(outColor, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void CelShading(uint3 id : SV_DispatchThreadID)
+{
+    float3 currColor = _ColorEdgeBuffer.Load(int3(id.xy, 0)).xyz;
+    float3 blurredColor = _BlurredEdgeBuffer.Load(int3(id.xy, 0)).xyz;
+    
+    float3 outColor = max(0.0, currColor - blurredColor);
+
+    _EdgesBufferRW[id.xy] = float4(outColor, 1.0);
+}
